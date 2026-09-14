@@ -387,15 +387,15 @@ function finishTrick(room){
   if(room.players.every(p=>p.hand.length===0)) finishRound(room); else { emit(room); sendHand(room); }
 }
 
-// ========== BOTS ==========
+// ========== BOTS (розумніша логіка) ==========
 const BOT_NAMES = ['Бот Алекс','Бот Оля','Бот Макс','Бот Іра','Бот Сергій','Бот Настя'];
 function scheduleBot(room){
   if(!room || !['bidding','prebid','playing'].includes(room.phase)) return;
-  if(room.phase==='playing' && room.trick.length===4) return; // чекаємо finishTrick
+  if(room.phase==='playing' && room.trick.length===4) return;
   const p = room.players[room.turn];
   if(!p || !p.bot) return;
   if(room._botTimer) clearTimeout(room._botTimer);
-  const delay = 700 + Math.floor(Math.random()*900);
+  const delay = 500 + Math.floor(Math.random()*700);
   room._botTimer = setTimeout(()=> botAct(room), delay);
 }
 function botAct(room){
@@ -406,29 +406,128 @@ function botAct(room){
   if(room.phase==='bidding' || room.phase==='prebid') botBid(room, p);
   else if(room.phase==='playing') botPlay(room, p);
 }
+
+function rankVal(c){ return VALUE[c.rank]??0; }
+function lowestCard(cards){
+  return cards.reduce((b,c)=> rankVal(c)<rankVal(b)?c:b);
+}
+function highestCard(cards){
+  return cards.reduce((b,c)=> rankVal(c)>rankVal(b)?c:b);
+}
+
+/** Оцінка сили руки → очікувані взятки */
+function estimateTricks(hand, trump, mode){
+  if(!hand || !hand.length) return 0;
+  let score = 0;
+  const bySuit = {};
+  for(const s of SUITS) bySuit[s]=[];
+  let hasJoker=false;
+  for(const c of hand){
+    if(c.joker){ hasJoker=true; continue; }
+    bySuit[c.suit].push(c);
+  }
+  if(hasJoker) score += 1.15;
+
+  if(mode==='misere'){
+    // На мізері рахуємо «ризик» взяток
+    let risk=0;
+    if(hasJoker) risk+=1;
+    for(const s of SUITS){
+      const arr=bySuit[s];
+      if(!arr.length) continue;
+      const hi=Math.max(...arr.map(rankVal));
+      if(hi>=7) risk+=0.7; // A/K
+      else if(hi>=5) risk+=0.35;
+      if(arr.length>=4) risk+=0.3;
+    }
+    return risk;
+  }
+
+  for(const s of SUITS){
+    const arr=bySuit[s];
+    if(!arr.length) continue;
+    const isTrump = trump && s===trump;
+    const sorted=[...arr].sort((a,b)=>rankVal(b)-rankVal(a));
+    for(let i=0;i<sorted.length;i++){
+      const v=rankVal(sorted[i]);
+      if(isTrump){
+        if(v>=7) score+=0.95;      // A/K козир
+        else if(v>=5) score+=0.7;  // Q/J
+        else if(v>=3) score+=0.45;
+        else score+=0.25;
+      } else if(mode==='notrump' || !trump){
+        if(v>=7) score+=0.85;
+        else if(v>=5) score+=0.4;
+        else if(v>=3 && sorted.length<=2) score+=0.15;
+      } else {
+        // звичайна масть
+        if(v>=7) score+=0.75;
+        else if(v>=5 && sorted.length<=2) score+=0.25;
+        // короткі масті — шанс козирити
+        if(arr.length===1 && v<5) score+=0.1;
+      }
+    }
+    // довгий козир
+    if(isTrump && arr.length>=3) score += 0.35*(arr.length-2);
+  }
+  // void + trump = потенційна взятка
+  if(trump){
+    const voids = SUITS.filter(s=>s!==trump && bySuit[s].length===0).length;
+    const trN = bySuit[trump].length;
+    score += Math.min(voids, trN)*0.35;
+  }
+  return Math.max(0, score);
+}
+
 function botBid(room, p){
   const r = room.round;
   const nMax = r.cards;
   const othersSum = room.players.reduce((s,pl,i)=> i===room.turn ? s : s + (pl.bid??0), 0);
   const isLast = room.players.filter(pl=>pl.bid!==null).length === 3;
   const blockZero = isBiddingMode(r.mode) && (p.zeroBidStreak||0)>=2;
-  let choices = [];
-  for(let i=0;i<=nMax;i++){
-    if(blockZero && i===0) continue;
-    if(isLast && othersSum + i === nMax) continue;
-    choices.push(i);
+
+  let estimate;
+  if(r.mode==='dark' || room.phase==='prebid'){
+    // Темна: карти ще не роздані — обережна оцінка
+    estimate = Math.max(0, Math.round(nMax*0.22 + Math.random()*1.2 - 0.3));
+  } else if(r.mode==='gold'){
+    // На золотій немає торгів — не викликається
+    estimate = 0;
+  } else if(r.mode==='misere'){
+    estimate = 0; // на мізері торгів немає
+  } else {
+    const raw = estimateTricks(p.hand, room.trump, r.mode);
+    // трохи консервативно + шум
+    estimate = Math.round(raw*0.92 + (Math.random()*0.6-0.2));
   }
-  if(!choices.length){
-    // Якщо 0 заборонено і всі інші конфліктують — візьмемо мінімально дозволене
-    for(let i=0;i<=nMax;i++){
-      if(blockZero && i===0) continue;
-      choices.push(i);
+  estimate = Math.max(0, Math.min(nMax, estimate));
+
+  // Якщо вже 2 нулі підряд — мінімум 1
+  if(blockZero && estimate===0) estimate=1;
+
+  // Останній гравець: сума ≠ nMax
+  if(isLast && othersSum + estimate === nMax){
+    if(estimate+1 <= nMax) estimate++;
+    else if(estimate-1 >= (blockZero?1:0)) estimate--;
+    else {
+      // крайній випадок
+      for(let d=1;d<=nMax;d++){
+        if(estimate+d<=nMax && othersSum+(estimate+d)!==nMax){ estimate+=d; break; }
+        if(estimate-d>=(blockZero?1:0) && othersSum+(estimate-d)!==nMax){ estimate-=d; break; }
+      }
     }
   }
-  if(!choices.length) choices = [blockZero?1:0];
-  const mid = Math.round(nMax/2);
-  choices.sort((a,b)=> Math.abs(a-mid) - Math.abs(b-mid) || Math.random()-0.5);
-  const pick = choices[Math.floor(Math.random()*Math.min(3, choices.length))];
+
+  // Фінальна перевірка допустимості
+  let pick = estimate;
+  if(blockZero && pick===0) pick=1;
+  if(isLast && othersSum + pick === nMax){
+    pick = pick===0 ? 1 : (pick-1>=0 && !(blockZero&&pick-1===0) ? pick-1 : Math.min(nMax, pick+1));
+    if(isLast && othersSum + pick === nMax && pick+1<=nMax) pick++;
+  }
+  pick = Math.max(0, Math.min(nMax, pick));
+  if(blockZero && pick===0) pick = Math.min(nMax,1);
+
   p.bid = pick;
   addLog(room, `${p.name}: замовлення ${pick}.`);
   if(allBids(room)){
@@ -438,27 +537,165 @@ function botBid(room, p){
     emit(room);
   }
 }
+
+/** Хто зараз виграє взятку (серед уже покладених) */
+function currentTrickWinner(room){
+  if(!room.trick.length) return null;
+  return winnerOf(room, room.trick);
+}
+
+/** Чи наша карта поб'є поточну взятку */
+function wouldWin(room, card, status){
+  const trial = room.trick.concat([{player: room.turn, card: status ? {...card, status}:{...card}}]);
+  try {
+    const w = winnerOf(room, trial);
+    return w && w.player === room.turn;
+  } catch(e){ return false; }
+}
+
+function botPickJokerStatus(room, p, wantTrick){
+  const isLead = room.trick.length===0;
+  if(isLead){
+    if(wantTrick && room.trump){
+      // забрати козирі суперників
+      return {type:'trumpHigh'};
+    }
+    // найсильніша масть у руці (без козиря) або випадкова
+    const counts={};
+    for(const s of SUITS) counts[s]=0;
+    for(const c of p.hand){ if(!c.joker) counts[c.suit]=(counts[c.suit]||0)+1; }
+    let best=SUITS[0], bestN=-1;
+    for(const s of SUITS){
+      if(room.trump && s===room.trump) continue;
+      if((counts[s]||0)>bestN){ bestN=counts[s]||0; best=s; }
+    }
+    if(wantTrick) return {type:'suit', suit:best};
+    return {type:'giveSuit', suit:best};
+  }
+  // не з заходу
+  if(wantTrick) return {type:'take'};
+  // скинути як слабку масть
+  const lead = room.trick[0]?.card;
+  const leadSuit = lead && !lead.joker ? lead.suit : (room.trump||SUITS[0]);
+  return {type:'asSuit', suit: leadSuit};
+}
+
 function botPlay(room, p){
   const allowed = validCards(room, p);
   if(!allowed.length) return;
-  let card = allowed.find(c=>!c.joker) || allowed[0];
+  const r = room.round;
+  const mode = r.mode;
+  const bid = p.bid??0;
+  const need = bid - (p.tricks||0); // скільки ще треба
+  const remainingTricks = p.hand.length; // приблизно = карт у руці
+  const mustTake = need > 0;
+  const mustDump = mode==='misere' || (need <= 0 && mode!=='gold');
+  const desperate = mustTake && need >= remainingTricks; // треба майже все
+
+  const jokers = allowed.filter(c=>c.joker);
   const nonJ = allowed.filter(c=>!c.joker);
-  if(nonJ.length){
-    card = nonJ.reduce((best,c)=> (VALUE[c.rank]??0) < (VALUE[best.rank]??0) ? c : best);
-  }
-  if(card.joker){
-    const isLead=room.trick.length===0;
-    let status;
-    if(isLead){
-      status=room.trump?{type:'trumpHigh'}:{type:'suit',suit:SUITS[Math.floor(Math.random()*4)]};
-      if(status.type==='trumpHigh'&&!room.trump) status={type:'suit',suit:SUITS[0]};
-    } else {
-      status={type:'take'};
+  const isLead = room.trick.length===0;
+  const trump = room.trump;
+
+  let card=null;
+  let status=null;
+
+  // --- МІЗЕР / скидання ---
+  if(mustDump && !desperate){
+    if(nonJ.length){
+      // наймолодша, бажано не козир (на мізері козир небезпечний)
+      const nonTr = trump ? nonJ.filter(c=>c.suit!==trump) : nonJ;
+      const pool = nonTr.length ? nonTr : nonJ;
+      card = lowestCard(pool);
+    } else if(jokers.length){
+      card = jokers[0];
+      status = botPickJokerStatus(room, p, false);
     }
-    card.status={...status};
-    const label=status.type==='trumpHigh'?'по старших козирях':status.type==='suit'?`по старших ${status.suit}`:'забрати взятку';
-    addLog(room,`${p.name} ходить джокером: ${label}.`);
   }
+
+  // --- ЗАХІД ---
+  if(!card && isLead){
+    if(mustTake || mode==='gold'){
+      // ходити з сильної: козирний туз / старший козир / туз
+      const trumps = trump ? nonJ.filter(c=>c.suit===trump) : [];
+      const aces = nonJ.filter(c=>c.rank==='A' && (!trump || c.suit!==trump));
+      if(trumps.length && (desperate || Math.random()<0.55)){
+        card = highestCard(trumps);
+      } else if(aces.length){
+        card = aces[0];
+      } else if(trumps.length){
+        card = highestCard(trumps);
+      } else if(nonJ.length){
+        card = highestCard(nonJ);
+      } else if(jokers.length){
+        card = jokers[0];
+        status = botPickJokerStatus(room, p, true);
+      }
+    } else {
+      // скидання: наймолодша некозирна
+      const nonTr = trump ? nonJ.filter(c=>c.suit!==trump) : nonJ;
+      const pool = nonTr.length ? nonTr : nonJ;
+      if(pool.length) card = lowestCard(pool);
+      else if(jokers.length){ card=jokers[0]; status=botPickJokerStatus(room,p,false); }
+    }
+  }
+
+  // --- ВІДПОВІДЬ У ВЗЯТКУ ---
+  if(!card && !isLead){
+    const cur = currentTrickWinner(room);
+    const winningUs = cur && cur.player === room.turn; // ще не ходили, завжди false
+    // карти, якими можемо взяти
+    const winners = nonJ.filter(c=> wouldWin(room, c, null));
+    const losers = nonJ.filter(c=> !wouldWin(room, c, null));
+
+    if(mustTake || mode==='gold'){
+      if(winners.length){
+        // мінімальна карта, що все ще бере
+        card = winners.reduce((b,c)=> rankVal(c)<rankVal(b)?c:b);
+        // якщо desperate — можна й старшу
+        if(desperate) card = highestCard(winners);
+      } else if(jokers.length && (desperate || need>0)){
+        card = jokers[0];
+        status = {type:'take'};
+        if(!wouldWin(room, card, status)) status = {type:'take'};
+      } else if(nonJ.length){
+        card = lowestCard(nonJ); // не можемо взяти — скинути дешеву
+      }
+    } else {
+      // не треба взятка
+      if(losers.length) card = lowestCard(losers);
+      else if(nonJ.length) card = lowestCard(nonJ);
+      else if(jokers.length){
+        card = jokers[0];
+        status = botPickJokerStatus(room, p, false);
+      }
+    }
+  }
+
+  // fallback
+  if(!card){
+    card = nonJ.length ? lowestCard(nonJ) : (jokers[0]||allowed[0]);
+    if(card.joker && !status) status = botPickJokerStatus(room, p, mustTake);
+  }
+
+  if(card.joker){
+    if(!status) status = botPickJokerStatus(room, p, mustTake || mode==='gold');
+    if(!validateJokerStatus(room, status, isLead)){
+      status = isLead
+        ? (room.trump ? {type:'trumpHigh'} : {type:'suit', suit:SUITS[0]})
+        : {type: mustTake ? 'take' : 'asSuit', suit: room.trump||SUITS[0]};
+    }
+    card.status = {...status};
+    const label = status.type==='trumpHigh' ? 'по старших козирях'
+      : status.type==='suit' ? `по старших ${status.suit}`
+      : status.type==='giveSuit' ? `віддати ${status.suit}`
+      : status.type==='take' ? 'забрати взятку'
+      : status.type==='asSuit' ? `як ${status.suit}` : 'джокером';
+    addLog(room, `${p.name} ходить джокером: ${label}.`);
+  } else {
+    delete card.status;
+  }
+
   const idx = p.hand.findIndex(c=>c.id===card.id);
   if(idx<0) return;
   p.hand.splice(idx,1);
