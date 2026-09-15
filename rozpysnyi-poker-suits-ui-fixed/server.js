@@ -346,13 +346,13 @@ function scoreRound(room){
       // - точно: +10 за кожну взятку
       // - 0/0: +5
       // - перебір (взяток більше ніж замовлено): +1 за кожну взятку
-      // - недобір: -10
+      // - недобір: −10 за кожну недобрану (замовлена − взята)
       // На Темній усі ці очки ×2
       let base;
       if(p.bid===0 && p.tricks===0) base=5;
       else if(p.bid===p.tricks) base=10*p.tricks;
       else if(p.tricks > p.bid) base=1*p.tricks; // перебір
-      else base=-10; // недобір
+      else base=-10 * ((p.bid||0) - (p.tricks||0)); // недобір за кожну недобрану
       delta=r.mode==='dark'?base*2:base;
     }
     p.score+=delta;
